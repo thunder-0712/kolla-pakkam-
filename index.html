@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+    <script async="" src="https://connect.facebook.net/en_US/fbevents.js"></script><script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Thunder Sureshots — Premium Channel (Editor)</title>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&amp;family=Barlow:wght@400;500;600;700;800&amp;family=Bebas+Neue&amp;display=swap" rel="stylesheet">
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body {
+    background:#020202; color:#fff; font-family:'Poppins',sans-serif;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    min-height:100vh; padding:20px; position:relative; overflow-x:hidden;
+  }
+  .bg-effects { position:fixed; inset:0; background:radial-gradient(circle at top center,#0d121c,#020202 60%); z-index:-2; }
+  .particles {
+    position:fixed; inset:0; z-index:-1;
+    background-image:
+      radial-gradient(circle at 15% 20%, rgba(255,184,77,.4) 1px, transparent 2px),
+      radial-gradient(circle at 80% 40%, rgba(255,184,77,.2) 1.5px, transparent 2px),
+      radial-gradient(circle at 35% 70%, rgba(255,184,77,.5) 1px, transparent 2px),
+      radial-gradient(circle at 85% 85%, rgba(255,184,77,.3) 1.5px, transparent 2px),
+      radial-gradient(circle at 10% 90%, rgba(255,184,77,.2) 1px, transparent 2px),
+      radial-gradient(circle at 50% 10%, rgba(255,184,77,.5) 1px, transparent 2px);
+    background-size:150px 150px; opacity:.7; animation:drift 50s linear infinite;
+  }
+  @keyframes drift { 0%{transform:translateY(0);} 100%{transform:translateY(-150px);} }
+
+  .card {
+    background:#090c14; border:1px solid rgba(255,255,255,.05); border-radius:28px;
+    width:100%; max-width:420px; padding:45px 15px 30px; text-align:center;
+    box-shadow:0 15px 40px rgba(0,0,0,.8); position:relative; margin-top:30px;
+  }
+  .profile-img {
+    width:95px; height:95px; border-radius:50%; object-fit:cover;
+    border:3px solid #090c14; position:absolute; top:-47px; left:50%;
+    transform:translateX(-50%); background:#222; z-index:2;
+  }
+  .badge {
+    display:inline-flex; align-items:center; gap:6px; background:transparent;
+    color:#ffb84d; border:1px solid #ffb84d; padding:6px 16px; border-radius:20px;
+    font-size:.75rem; font-weight:600; margin-bottom:25px; letter-spacing:.5px;
+  }
+  .title { font-size:2.2rem; font-weight:800; line-height:1.1; margin-bottom:15px; text-transform:uppercase; color:#fff; letter-spacing:-.5px; }
+  .subtitle { font-size:1rem; color:#fff; margin-bottom:25px; font-weight:600; }
+  .features { font-size:.9rem; color:#cbd5e1; line-height:1.8; margin-bottom:35px; padding:0 10px; }
+
+  @keyframes breatheAndGlow {
+    0% { transform:scale(1); box-shadow:0 0 10px rgba(255,140,0,.2); }
+    50% { transform:scale(1.02); box-shadow:0 0 15px rgba(255,140,0,.4); }
+    100% { transform:scale(1); box-shadow:0 0 10px rgba(255,140,0,.2); }
+  }
+  .btn {
+    display:flex; align-items:center; justify-content:center; gap:10px; width:100%;
+    background:linear-gradient(90deg,#ff9100 0%,#ff6600 100%); color:#fff;
+    text-decoration:none; padding:18px 20px; border-radius:35px; font-weight:800;
+    font-size:1.1rem; text-transform:uppercase; position:relative; z-index:1;
+    margin-bottom:12px; letter-spacing:.5px; border:none; cursor:pointer;
+    animation:breatheAndGlow 2.5s infinite ease-in-out; transition:filter .2s ease;
+  }
+  .btn:active { filter:brightness(.9); }
+  .redirect-text { font-size:.8rem; color:#94a3b8; margin-bottom:25px; }
+
+  .stats-container { display:flex; justify-content:space-between; border-top:1px solid rgba(255,255,255,.08); padding-top:25px; }
+  .stat-box { flex:1; }
+  .stat-value { color:#ffb84d; font-size:1.25rem; font-weight:800; margin-bottom:4px; }
+  .stat-label { color:#94a3b8; font-size:.65rem; font-weight:600; letter-spacing:1px; text-transform:uppercase; }
+
+  /* Edit tooling */
+  #editPanel * { font-family:'Courier New',monospace; box-sizing:border-box; }
+  #editPanel textarea, #editPanel input[type=text] {
+    width:100%; background:#151816; border:1px solid #232622; color:#eef0ee;
+    padding:8px; border-radius:6px; font-size:12.5px; font-family:'Courier New',monospace;
+  }
+  #editPanel textarea:focus, #editPanel input:focus{ outline:1px solid #00ff9c; }
+  #editPanel button.act { background:#00ff9c; color:#04120c; border:none; font-weight:700; padding:6px 10px; border-radius:5px; font-size:11px; cursor:pointer; }
+  #editPanel button.sec { background:transparent; color:#00ff9c; border:1px solid #0a6b47; padding:6px 10px; border-radius:5px; font-size:11px; cursor:pointer; }
+  #editPanel button.clr { background:transparent; color:#ff5c5c; border:1px solid #5c2323; padding:6px 10px; border-radius:5px; font-size:11px; cursor:pointer; }
+  #editToggle {
+    position:fixed; bottom:16px; right:16px; z-index:99999;
+    background:#00ff9c; color:#04120c; border:none; font-weight:700;
+    padding:12px 16px; border-radius:30px; font-family:'Courier New',monospace;
+    font-size:13px; cursor:pointer; box-shadow:0 6px 20px rgba(0,0,0,0.4);
+  }
+  #editPanel {
+    position:fixed; top:0; right:0; height:100vh; width:380px; max-width:92vw;
+    background:#070808; border-left:1px solid #232622; z-index:99998;
+    overflow-y:auto; padding:18px; transform:translateX(100%);
+    transition:transform 0.25s ease; color:#eef0ee;
+  }
+  #editPanel.open { transform:translateX(0); }
+  #editPanel h2 { color:#00ff9c; font-size:13px; text-transform:uppercase; letter-spacing:1px; margin:14px 0 12px; }
+  #editPanel h2:first-child { margin-top:0; }
+  .field-card { background:#101211; border:1px solid #232622; border-radius:8px; padding:10px; margin-bottom:10px; }
+  .field-card label { display:block; color:#8a938e; font-size:10px; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; }
+  .field-status { color:#8a938e; font-size:10.5px; margin-top:4px; min-height:14px; }
+  .field-status.ok { color:#00ff9c; }
+  .field-status.err { color:#ff5c5c; }
+  .redirect-option { background:#101211; border:1px solid #232622; border-radius:8px; padding:10px; margin-bottom:14px; }
+  .redirect-option label { color:#eef0ee; font-size:11.5px; display:flex; align-items:center; gap:8px; cursor:pointer; }
+  .redirect-option p { color:#8a938e; font-size:10.5px; margin:6px 0 0; }
+</style>
+</head>
+<body data-pixel-id="1993883437976798" data-telegram-link="https://t.me/+-W7jRssd--dlNjI1" data-redirect-seconds="18" data-redirect-enabled="false">
+
+<!-- Meta Pixel Code -->
+<script>
+!function(f,b,e,v,n,t,s)
+{if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+n.callMethod.apply(n,arguments):n.queue.push(arguments)};
+if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';
+n.queue=[];t=b.createElement(e);t.async=!0;
+t.src=v;s=b.getElementsByTagName(e)[0];
+s.parentNode.insertBefore(t,s)}(window, document,'script',
+'https://connect.facebook.net/en_US/fbevents.js');
+fbq('init', '1678668730452690');
+fbq('track', 'PageView');
+</script>
+<noscript><img height="1" width="1" style="display:none"
+src="https://www.facebook.com/tr?id=1678668730452690&ev=PageView&noscript=1"
+/></noscript>
+<!-- End Meta Pixel Code -->
+
+<!-- ============== LANDING PAGE (audience-facing) — editable as a block via "Custom HTML" in the panel ============== -->
+<div id="pageContent"><style>
+  #pageContent{position:relative;display:flex;min-height:100svh;width:100%;align-items:center;justify-content:center;overflow:hidden;background:#070b1f;padding:16px;color:#fff;font-family:'Barlow',system-ui,sans-serif;box-sizing:border-box}
+  #pageContent *{box-sizing:border-box}
+  #pageContent .sh-bg{pointer-events:none;position:absolute;inset:0;background:radial-gradient(60% 45% at 50% 0%, rgba(37,99,235,.28), transparent 70%), radial-gradient(45% 35% at 50% 100%, rgba(34,197,94,.12), transparent 70%)}
+  #pageContent .sh-wrap{position:relative;z-index:10;margin:0 auto;display:flex;width:100%;max-width:384px;flex-direction:column;align-items:center;text-align:center}
+  #pageContent .sh-crown{display:flex;align-items:center;gap:8px;color:#facc15}
+  #pageContent .sh-badge{margin-top:4px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.28em;color:rgba(147,197,253,.8)}
+  #pageContent h1.sh-title{margin-top:8px;font-family:'Bebas Neue',sans-serif;font-size:2.65rem;font-weight:900;text-transform:uppercase;line-height:.92;letter-spacing:.02em}
+  #pageContent .sh-title-gold{display:block;background:linear-gradient(to bottom,#fef08a,#facc15,#ca8a04);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  #pageContent .sh-title-white{margin-top:4px;display:block;color:#fff}
+  #pageContent ul.sh-list{margin-top:16px;display:grid;width:100%;gap:8px;text-align:left;list-style:none;padding:0}
+  #pageContent ul.sh-list li{display:flex;align-items:center;gap:12px;border-radius:8px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);padding:8px 12px;font-size:12px;font-weight:600}
+  #pageContent .sh-check{display:grid;flex-shrink:0;width:20px;height:20px;place-items:center;border-radius:50%;background:#22c55e;color:#fff}
+  #pageContent .sh-cta{margin-top:16px;display:grid;grid-template-columns:auto minmax(0,1fr) auto;width:100%;align-items:center;gap:12px;border-radius:12px;border:1px solid rgba(147,197,253,.6);background:linear-gradient(to bottom,#60a5fa,#1d4ed8);padding:12px 20px;text-decoration:none;font-size:16px;font-weight:800;text-transform:uppercase;letter-spacing:.02em;color:#fff;box-shadow:0 0 28px rgba(59,130,246,.7);transition:transform .15s}
+  #pageContent .sh-cta:active{transform:scale(.95)}
+  #pageContent .sh-cta svg{flex-shrink:0}
+  #pageContent .sh-cta span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #pageContent .sh-timer-wrap{margin-top:16px;display:grid;place-items:center}
+  #pageContent .sh-timer-ring{display:grid;width:96px;height:96px;place-items:center;border-radius:50%;background:conic-gradient(#22c55e var(--timer-progress,360deg), rgba(255,255,255,.08) 0deg)}
+  #pageContent .sh-timer-inner{display:grid;width:80px;height:80px;place-items:center;border-radius:50%;background:#0b1029}
+  #pageContent .sh-timer-num{display:block;font-family:'Bebas Neue',sans-serif;font-size:30px;font-weight:900;line-height:1;color:#4ade80}
+  #pageContent .sh-timer-label{margin-top:2px;display:block;font-size:7px;font-weight:700;text-transform:uppercase;letter-spacing:.15em;color:rgba(255,255,255,.5)}
+  #pageContent .sh-timer-sub{margin-top:6px;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.15em;color:rgba(255,255,255,.4)}
+  #pageContent .sh-disclaimer{margin-top:12px;font-size:8px;font-weight:500;text-transform:uppercase;letter-spacing:.15em;color:rgba(255,255,255,.3)}
+</style>
+<div class="sh-bg"></div>
+<div class="sh-wrap">
+  <div class="sh-crown"><svg xmlns="http://www.w3.org/2000/svg" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11.562 3.266a.5.5 0 0 1 .876 0L15.39 8.87a1 1 0 0 0 1.516.294L21.183 5.5a.5.5 0 0 1 .798.519l-2.834 10.246a1 1 0 0 1-.956.734H5.81a1 1 0 0 1-.957-.734L2.02 6.02a.5.5 0 0 1 .798-.519l4.276 3.664a1 1 0 0 0 1.516-.294z"></path><path d="M5 21h14"></path></svg></div>
+  <p class="sh-badge" data-field="autoText1">Official Telegram Channel</p>
+  <h1 class="sh-title"><span class="sh-title-gold" data-field="autoText2">Sureshot</span><span class="sh-title-white" data-field="autoText3">By Arjun Team</span></h1>
+  <ul class="sh-list">
+    <li><span class="sh-check"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg></span><span data-field="autoText4">நிபுணர் வண்ண கணிப்பு பகுப்பாய்வு</span></li>
+    <li><span class="sh-check"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg></span><span data-field="autoText5">"தினசரி இலவச உறுதியான வாய்ப்பு"</span></li>
+    <li><span class="sh-check"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg></span><span data-field="autoText6">வேகமான முடிவுகள் &amp; நேரடி புதுப்பிப்புகள்</span></li>
+    <li><span class="sh-check"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg></span><span data-field="autoText7">"பாதுகாப்பான, நம்பகமான சமூகம்"</span></li>
+  </ul>
+  <a href="https://t.me/+-W7jRssd--dlNjI1" target="_blank" rel="noreferrer" class="sh-cta" data-btn-index="0"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"></path><path d="m21.854 2.147-10.94 10.939"></path></svg><span data-field="autoText8">Join Telegram Now</span><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"></path><path d="m21.854 2.147-10.94 10.939"></path></svg></a>
+  <div class="sh-timer-wrap">
+    <div class="sh-timer-ring" style="--timer-progress:360deg" aria-label="18 seconds remaining">
+      <div class="sh-timer-inner">
+        <div>
+          <span class="sh-timer-num" id="countdown" data-field="autoText9">18</span>
+          <span class="sh-timer-label" data-field="autoText10">Seconds Left</span>
+        </div>
+      </div>
+    </div>
+    <p class="sh-timer-sub" id="redirectLine" data-field="autoText11">Next free update</p>
+  </div>
+  <p class="sh-disclaimer" data-field="autoText12">Analysis is informational • Play responsibly</p>
+</div></div>
+<!-- ============== END LANDING PAGE ============== -->
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!-- ============== EDIT TOOLING (only two elements — both simply deleted from the DOM before download, nothing rebuilt) ============== -->
+
+
+
+
+<script>
+  // ---- Read config from body attributes (this is what makes export safe —
+  // nothing here ever gets rewritten as script text; it's just DOM attributes,
+  // which cloneNode() carries over automatically) ----
+  function getConfig(){
+    var b = document.body;
+    return {
+      pixelId: b.getAttribute('data-pixel-id') || '',
+      telegramLink: b.getAttribute('data-telegram-link') || '',
+      redirectSeconds: parseInt(b.getAttribute('data-redirect-seconds'), 10) || 10,
+      redirectEnabled: b.getAttribute('data-redirect-enabled') === 'true'
+    };
+  }
+
+  var isEditorMode = !!document.getElementById('editPanel');
+  var CONFIG = getConfig();
+
+  // ---- Every <a> / <button> inside the page is treated as a clickable CTA:
+  // it gets click tracking, and its own editable link in the panel. ----
+  function getPageButtons(){
+    var pc = document.getElementById('pageContent') || document.body;
+    return Array.prototype.slice.call(pc.querySelectorAll('a, button'));
+  }
+
+  var countdownEl0 = document.getElementById('countdown');
+  if(countdownEl0) countdownEl0.textContent = CONFIG.redirectSeconds;
+
+  // ---- No custom click tracking — Meta's own base Pixel snippet already
+  // fires PageView automatically on load, which is the only signal this
+  // page sends. Buttons are left as plain, real links: no JS intercepts
+  // the click, no event fires, nothing to dedupe. If you need a specific
+  // conversion event, set it up in Meta's Events Manager instead. ----
+  function wireJoinButtons(){
+    getPageButtons().forEach(function(btn, i){
+      btn.setAttribute('data-btn-index', i);
+    });
+  }
+  wireJoinButtons();
+
+  // ---- Auto-load Tailwind's CDN runtime if this page's markup uses Tailwind
+  // utility classes (common with AI page-builder exports like Lovable) and
+  // we don't already have the compiled stylesheet for it. Runs for every
+  // real page load — editor preview AND the actual deployed page — since
+  // Tailwind generates its CSS at runtime, not something that gets "baked in"
+  // once and forgotten. ----
+  var tailwindInjected = !!window.tailwind;
+  function ensureTailwindIfNeeded(container){
+    if(tailwindInjected || !container) return false;
+    var sample = container.innerHTML;
+    var tailwindSignals = /class="[^"]*\b(flex|grid|px-\d|py-\d|mt-\d|gap-\d|rounded-(lg|xl|full|md|2xl|3xl)|shadow-|uppercase|tracking-|bg-\[|text-\[|grid-cols-|place-items-|size-\d)/;
+    if(!tailwindSignals.test(sample)) return false;
+    tailwindInjected = true;
+    var script = document.createElement('script');
+    script.src = 'https://cdn.tailwindcss.com';
+    document.head.appendChild(script);
+    return true;
+  }
+  ensureTailwindIfNeeded(document.getElementById('pageContent'));
+
+  // Sync any repeated/mirrored profile photo spots (header, footer, etc.) from the
+  // single embedded copy on page load, so the image only needs to be stored once.
+  (function syncLogoMirrors(){
+    var li = document.getElementById('logoImg');
+    if(!li) return;
+    var src = li.getAttribute('src');
+    if(!src) return;
+    document.querySelectorAll('.logoImg-mirror').forEach(function(m){
+      if(!m.getAttribute('src')) m.src = src;
+    });
+  })();
+
+  // ---- Optional decorative canvas background. Lives here (not inside the
+  // editable Page HTML) so it's a genuine part of the file's real source —
+  // real <script> tags execute normally on page load, unlike ones inserted
+  // live via the Page HTML box. Re-runs after every Page HTML edit too, in
+  // case a pasted design brings its own #synthCanvas along. ----
+  var synthCanvasStarted = false;
+  function initSynthCanvas(){
+    var canvas = document.getElementById('synthCanvas');
+    if(!canvas || synthCanvasStarted) return;
+    synthCanvasStarted = true;
+    var ctx = canvas.getContext('2d');
+    var W, H, offset = 0, particles = [], animationId;
+
+    function resize(){
+      W = canvas.width = window.innerWidth;
+      H = canvas.height = window.innerHeight;
+      initParticles();
+    }
+    function initParticles(){
+      particles = [];
+      var count = Math.max(40, Math.floor((W * H) / 20000));
+      var COLORS = ['255,32,121', '0,240,255', '204,255,0', '176,38,255'];
+      for(var i = 0; i < count; i++){
+        particles.push({
+          x: Math.random() * W,
+          y: Math.random() * H,
+          r: 0.8 + Math.random() * 2,
+          speed: 0.3 + Math.random() * 0.9,
+          c: COLORS[i % COLORS.length]
+        });
+      }
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    function drawSun(horizonY){
+      var cx = W * 0.5;
+      var r = Math.min(W, H) * 0.28;
+      var grad = ctx.createRadialGradient(cx, horizonY, 0, cx, horizonY, r);
+      grad.addColorStop(0, 'rgba(255,32,121,0.55)');
+      grad.addColorStop(0.5, 'rgba(176,38,255,0.28)');
+      grad.addColorStop(1, 'rgba(176,38,255,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(cx, horizonY, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, horizonY, r * 0.62, 0, Math.PI * 2);
+      ctx.clip();
+      for(var i = 0; i < 6; i++){
+        var y = horizonY - r * 0.62 + (i * r * 1.24) / 6;
+        ctx.fillStyle = 'rgba(3,0,4,0.85)';
+        ctx.fillRect(cx - r, y, r * 2, r * 0.09);
+      }
+      ctx.restore();
+    }
+
+    function drawGrid(horizonY){
+      ctx.strokeStyle = 'rgba(0,240,255,0.4)';
+      ctx.lineWidth = 1;
+      var vanishX = W * 0.5;
+      var spread = W * 0.9;
+      for(var i = -12; i <= 12; i++){
+        ctx.beginPath();
+        ctx.moveTo(vanishX + i * 14, horizonY);
+        ctx.lineTo(vanishX + i * spread, H);
+        ctx.strokeStyle = 'rgba(255,32,121,' + (0.32 - Math.abs(i) * 0.012) + ')';
+        ctx.stroke();
+      }
+      var rows = 14;
+      for(var j = 0; j < rows; j++){
+        var p = ((j + offset) % rows) / rows;
+        var y = horizonY + Math.pow(p, 2.6) * (H - horizonY);
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.strokeStyle = 'rgba(0,240,255,' + (0.5 * p) + ')';
+        ctx.stroke();
+      }
+    }
+
+    function drawParticles(){
+      for(var i = 0; i < particles.length; i++){
+        var p = particles[i];
+        p.y -= p.speed;
+        if(p.y < -5){ p.y = H + 5; p.x = Math.random() * W; }
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(' + p.c + ',0.8)';
+        ctx.shadowColor = 'rgba(' + p.c + ',1)';
+        ctx.shadowBlur = 8;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+    }
+
+    function draw(){
+      if(!document.getElementById('synthCanvas')){
+        cancelAnimationFrame(animationId);
+        synthCanvasStarted = false;
+        return;
+      }
+      ctx.clearRect(0, 0, W, H);
+      var horizonY = H * 0.42;
+      drawSun(horizonY);
+      drawGrid(horizonY);
+      drawParticles();
+      offset += 0.012;
+      animationId = requestAnimationFrame(draw);
+    }
+    animationId = requestAnimationFrame(draw);
+    document.addEventListener('visibilitychange', function(){
+      if(document.hidden) cancelAnimationFrame(animationId);
+      else animationId = requestAnimationFrame(draw);
+    });
+  }
+  initSynthCanvas();
+
+  if(!isEditorMode){
+    if(CONFIG.redirectEnabled){
+      (function(){
+        var countdownEl = document.getElementById('countdown');
+        if(countdownEl){
+          // A visible countdown needs per-second updates. Rendering via
+          // canvas instead of countdownEl.textContent means the tick never
+          // mutates the DOM tree — only touches canvas pixels — which is
+          // invisible to any DOM-watching script (like Meta's Event Setup
+          // Tool) that may be reacting to text-node mutations.
+          // Delayed two animation frames so async-loaded styles (e.g. the
+          // Tailwind CDN runtime) have finished applying before we measure
+          // the element — otherwise the canvas could be sized/fonted wrong.
+          requestAnimationFrame(function(){ requestAnimationFrame(function(){
+            var cs = window.getComputedStyle(countdownEl);
+            var rect = countdownEl.getBoundingClientRect();
+            var w = Math.max(rect.width, 20), h = Math.max(rect.height, 16);
+            var dpr = window.devicePixelRatio || 1;
+            var canvas = document.createElement('canvas');
+            canvas.width = w * dpr;
+            canvas.height = h * dpr;
+            canvas.style.width = w + 'px';
+            canvas.style.height = h + 'px';
+            canvas.style.display = 'inline-block';
+            canvas.style.verticalAlign = 'middle';
+            var ctx = canvas.getContext('2d');
+            ctx.scale(dpr, dpr);
+            ctx.font = cs.fontWeight + ' ' + cs.fontSize + ' ' + cs.fontFamily;
+            ctx.fillStyle = cs.color;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+
+            countdownEl.style.visibility = 'hidden';
+            countdownEl.style.position = 'absolute';
+            countdownEl.style.width = '0';
+            countdownEl.style.height = '0';
+            countdownEl.style.overflow = 'hidden';
+            countdownEl.parentNode.insertBefore(canvas, countdownEl.nextSibling);
+
+            function draw(n){
+              ctx.clearRect(0, 0, w, h);
+              ctx.fillText(String(n), w / 2, h / 2 + 1);
+            }
+            var secondsLeft = CONFIG.redirectSeconds;
+            draw(secondsLeft);
+            var timer = setInterval(function(){
+              secondsLeft--;
+              if(secondsLeft <= 0){
+                clearInterval(timer);
+                window.location.href = CONFIG.telegramLink;
+              } else {
+                draw(secondsLeft);
+              }
+            }, 1000);
+          }); });
+        } else {
+          // No visible countdown to update — one single deferred call instead
+          // of firing every second for nothing. Lighter on the page, and
+          // avoids the kind of continuous timer activity that's been seen to
+          // interfere with Meta's own Event Setup Tool script.
+          setTimeout(function(){
+            window.location.href = CONFIG.telegramLink;
+          }, CONFIG.redirectSeconds * 1000);
+        }
+      })();
+    } else {
+      var rl = document.getElementById('redirectLine');
+      if(rl) rl.remove();
+    }
+  }
+
+
+  // ================= EDIT PANEL (only runs while #editPanel exists) =================
+  
+</script>
+
+
+
+</body></html>
